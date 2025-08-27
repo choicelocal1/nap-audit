@@ -2,6 +2,7 @@ import csv
 import time
 import json
 import re
+import os
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -304,10 +305,10 @@ class NAPAuditor:
             
             # Look for location matches
             name1_words = set(name1_clean.split())
-            words2 = set(name2_clean.split())
+            name2_words = set(name2_clean.split())
             
             # If they share location words, it's a better match
-            common_words = words1.intersection(words2)
+            common_words = name1_words.intersection(name2_words)
             if common_words:
                 # Check for a contiguous phrase match if possible
                 if any(word in name2_lower for word in name1_lower.split()):
@@ -379,8 +380,18 @@ class NAPAuditor:
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--remote-debugging-port=9222")
             
+            # For Heroku deployment with Chrome for Testing
+            chrome_options.binary_location = os.environ.get("GOOGLE_CHROME_BIN", "/app/.chrome-for-testing/chrome-linux64/chrome")
+            
             # Initialize the WebDriver
-            driver = webdriver.Chrome(options=chrome_options)
+            # On Heroku, we need to specify the chromedriver path
+            chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "/app/.chrome-for-testing/chromedriver-linux64/chromedriver")
+            
+            if os.path.exists(chromedriver_path):
+                service = ChromeService(chromedriver_path)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+            else:
+                driver = webdriver.Chrome(options=chrome_options)
             
             # Get the page
             driver.get(url)
