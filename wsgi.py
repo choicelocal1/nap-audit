@@ -8,6 +8,7 @@ import pandas as pd
 import openpyxl
 import tempfile
 import smtplib
+import traceback
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -16,6 +17,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from nap import NAPAuditor # Import the NAPAuditor class
 from urllib.parse import urlparse
+from io import StringIO
 
 # =========================================================================
 # FLASK APPLICATION SETUP
@@ -69,6 +71,40 @@ def send_email(to_email, subject, body, attachment=None, attachment_filename=Non
         print(f"Error sending email: {e}")
         return False
 
+def send_error_notification(email_address, error_type, error_details, request_data=None):
+    """
+    Send error notification email
+    """
+    subject = f"NAP Audit Error: {error_type}"
+    
+    body = f"""Hello,
+
+An error occurred during the NAP audit process.
+
+Error Type: {error_type}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+Error Details:
+{error_details}
+
+"""
+    
+    if request_data:
+        body += f"""Request Data:
+- URL: {request_data.get('url', 'Not provided')}
+- Email: {request_data.get('email', 'Not provided')}
+- Filename: {request_data.get('filename', 'Not provided')}
+- Password: {'Provided' if request_data.get('password') else 'Not provided'}
+
+"""
+    
+    body += """Please check the application logs for more details.
+
+Thank you,
+NAP Audit System"""
+    
+    send_email(email_address, subject, body)
+
 # =========================================================================
 # GOOGLE SHEETS HELPER FUNCTION
 # =========================================================================
@@ -111,34 +147,66 @@ def run_audit_endpoint():
     API endpoint to trigger the NAP audit.
     It now expects a JSON payload with 'url', 'email', 'filename', and 'password'.
     """
+    request_data = {}
+    
     try:
         data = request.get_json()
+        request_data = data if data else {}
+        email_address = request_data.get('email', SMTP_EMAIL)  # Default to SMTP_EMAIL if not provided
         
         # 1. Validate the password
         if not data or 'password' not in data or data['password'] != API_PASSWORD:
-            return jsonify({'error': 'Unauthorized. Invalid or missing password.'}), 403
+            error_msg = 'Unauthorized. Invalid or missing password.'
+            if email_address and email_address != SMTP_EMAIL:
+                send_error_notification(
+                    email_address, 
+                    "Authentication Failed", 
+                    error_msg,
+                    request_data
+                )
+            return jsonify({'error': error_msg}), 403
 
         # 2. Check for other required fields
         required_fields = ['url', 'email', 'filename']
-        if not all(field in data for field in required_fields):
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            error_msg = f'Missing fields: {", ".join(missing_fields)}'
+            send_error_notification(
+                email_address, 
+                "Missing Required Fields", 
+                error_msg,
+                request_data
+            )
             return jsonify({'error': f'Missing fields. Required fields are: {required_fields}'}), 400
 
         google_sheet_url = data['url']
-        email_address = data['email']
         output_filename_prefix = data['filename']
         
         # 3. Download the Google Sheet data
         csv_data = get_sheet_data(google_sheet_url)
         if not csv_data:
-            return jsonify({"status": "error", "message": "Failed to download Google Sheet. Check the URL and sharing settings."}), 500
+            error_msg = "Failed to download Google Sheet. Check the URL and ensure the sheet is publicly accessible."
+            send_error_notification(
+                email_address, 
+                "Google Sheet Download Failed", 
+                error_msg,
+                request_data
+            )
+            return jsonify({"status": "error", "message": error_msg}), 500
 
         # 4. Read the business names from the downloaded CSV content
-        from io import StringIO
         df = pd.read_csv(StringIO(csv_data))
         business_names = df.iloc[:, 0].tolist()
         
         if not business_names:
-            return jsonify({"status": "error", "message": "No business names found in the spreadsheet."}), 400
+            error_msg = "No business names found in the spreadsheet."
+            send_error_notification(
+                email_address, 
+                "Empty Spreadsheet", 
+                error_msg,
+                request_data
+            )
+            return jsonify({"status": "error", "message": error_msg}), 400
 
         # 5. Run the audit
         auditor = NAPAuditor()
@@ -153,7 +221,14 @@ def run_audit_endpoint():
             output_df = pd.DataFrame(auditor.results)
             output_df.to_csv(csv_path, index=False)
         else:
-            return jsonify({"status": "error", "message": "NAP audit failed to produce a results file."}), 500
+            error_msg = "NAP audit completed but no results were generated."
+            send_error_notification(
+                email_address, 
+                "No Results Generated", 
+                error_msg,
+                request_data
+            )
+            return jsonify({"status": "error", "message": error_msg}), 500
 
         # 7. Convert to Excel and create the specific filename
         today_date = datetime.now().strftime('%m%d%Y')
@@ -169,7 +244,17 @@ def run_audit_endpoint():
         email_sent = send_email(
             to_email=email_address,
             subject="NAP Audit Results",
-            body="Hello,\n\nYour NAP audit is complete. The results are attached.\n\nThank you!",
+            body=f"""Hello,
+
+Your NAP audit is complete. The results are attached.
+
+Audit Summary:
+- Total businesses processed: {len(auditor.results)}
+- Input file: {google_sheet_url}
+- Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+Thank you!
+NAP Audit System""",
             attachment=file_data,
             attachment_filename=output_filename
         )
@@ -181,11 +266,33 @@ def run_audit_endpoint():
         if email_sent:
             return jsonify({"status": "success", "message": f"Audit complete. Results sent to {email_address}."}), 200
         else:
-            return jsonify({"status": "error", "message": "NAP audit completed, but failed to send the results via email. Check SMTP credentials."}), 500
+            error_msg = "NAP audit completed, but failed to send the results via email. Check SMTP credentials."
+            send_error_notification(
+                email_address, 
+                "Email Send Failed", 
+                error_msg,
+                request_data
+            )
+            return jsonify({"status": "error", "message": error_msg}), 500
 
     except Exception as e:
-        error_msg = f"An unexpected error occurred during processing: {str(e)}"
+        error_msg = f"An unexpected error occurred: {str(e)}"
+        error_traceback = traceback.format_exc()
         print(error_msg)
+        print(error_traceback)
+        
+        # Try to send error notification if we have an email address
+        try:
+            if 'email_address' in locals() and email_address:
+                send_error_notification(
+                    email_address, 
+                    "Unexpected Error", 
+                    f"{error_msg}\n\nTraceback:\n{error_traceback}",
+                    request_data
+                )
+        except:
+            pass  # Don't let error notification failure crash the endpoint
+            
         return jsonify({"status": "error", "message": error_msg}), 500
 
 @app.route('/')

@@ -20,8 +20,8 @@ from selenium.common.exceptions import WebDriverException, TimeoutException, NoS
 
 # Configuration
 SERVICE_ACCOUNT_FILE = 'nightwatch-302222-b4d76c4c4d34.json'
-YEXT_API_KEY = "7a2c551e133734c96da4f995aa5117df"
-YEXT_BASE_URL = "https://api.yext.com/v2/accounts"
+YEXT_API_KEY = os.environ.get("YEXT_API_KEY", "7a2c551e133734c96da4f995aa5117df")
+YEXT_BASE_URL = os.environ.get("YEXT_BASE_URL", "https://api.yext.com/v2/accounts")
 
 # Disable SSL warnings for debugging
 import urllib3
@@ -34,10 +34,23 @@ class NAPAuditor:
         
     def initialize_places_api(self):
         """Initialize the Google Places API client"""
-        credentials = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE,
-            scopes=['https://www.googleapis.com/auth/cloud-platform']
-        )
+        # Check if it's JSON content or a file path
+        service_account_info = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', SERVICE_ACCOUNT_FILE)
+        
+        try:
+            # Try to parse as JSON first (for Heroku)
+            service_account_data = json.loads(service_account_info)
+            credentials = service_account.Credentials.from_service_account_info(
+                service_account_data,
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+        except:
+            # If not JSON, treat as file path (for local development)
+            credentials = service_account.Credentials.from_service_account_file(
+                service_account_info,
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+        
         service = build('places', 'v1', credentials=credentials)
         return service
     
