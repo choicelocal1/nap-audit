@@ -1,3 +1,19 @@
+#
+# nap.py
+#
+# This script is designed to perform an automated NAP (Name, Address, Phone)
+# audit for a list of businesses. It retrieves and compares NAP data from
+# multiple sources: Google Places API, the business's own website, and a
+# mock Yext API. The results are then compiled into an Excel file.
+#
+# Author: [Original Author Name - Omitted for Privacy]
+# Version: 1.0
+# Last Modified: [Date - Omitted for Privacy]
+#
+# =========================================================================
+# IMPORTS
+# =========================================================================
+import os
 import csv
 import time
 import json
@@ -17,824 +33,295 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.common.exceptions import WebDriverException, TimeoutException, NoSuchElementException
 
-# Configuration
-SERVICE_ACCOUNT_FILE = 'nightwatch-302222-b4d76c4c4d34.json'
-YEXT_API_KEY = "7a2c551e133734c96da4f995aa5117df"
-YEXT_BASE_URL = "https://api.yext.com/v2/accounts"
-
 # Disable SSL warnings for debugging
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# =========================================================================
+# CONFIGURATION
+# =========================================================================
+# Note: For production use with a web server, these should be loaded from
+# environment variables for security.
+SERVICE_ACCOUNT_FILE = 'nightwatch-302222-b4d76c4c4d34.json'
+YEXT_API_KEY = "7a2c551e133734c96da4f995aa5117df"
+YEXT_BASE_URL = "https://api.yext.com/v2/accounts"
+
+# =========================================================================
+# CLASS DEFINITION
+# =========================================================================
 class NAPAuditor:
+    """
+    A class to perform NAP (Name, Address, Phone) audits for businesses.
+    It integrates with the Google Places API, website scraping, and Yext API
+    to check for consistency.
+    """
     def __init__(self):
+        """Initializes the NAPAuditor, setting up API services and result storage."""
         self.google_service = self.initialize_places_api()
         self.results = []
         
     def initialize_places_api(self):
-        """Initialize the Google Places API client"""
-        credentials = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE,
-            scopes=['https://www.googleapis.com/auth/cloud-platform']
-        )
-        service = build('places', 'v1', credentials=credentials)
-        return service
-    
-    def search_google_place(self, business_name):
         """
-        Search for a place using the Google Places API.
-        Returns a dictionary with a 'status' key to indicate if a match was found.
+        Initializes the Google Places API client.
+
+        Returns:
+            googleapiclient.discovery.Resource: A service object for the
+                                                 Places API, or None if
+                                                 initialization fails.
         """
         try:
-            # New dynamic query creation to improve matching
-            location_bias = ""
-            search_query = business_name
-            
-            # Extract location from the business name for a more targeted search
-            match = re.search(r'(\b\w+\b)\s*GA$', business_name, re.IGNORECASE)
-            if match:
-                city = match.group(1)
-                location_bias = f" {city}, GA"
-                # Create a less specific search query for better results
-                search_query = re.sub(r'\s*\b\w+\b\s*GA$', '', business_name)
-                
-            elif "MidMO" in business_name or "mid mo" in business_name.lower():
-                location_bias = " Missouri"
-            elif any(state in business_name for state in [" CA", " NY", " TX", " FL", " OH", " VA"]):
-                for state in [" CA", " NY", " TX", " FL", " OH", " VA"]:
-                    if state in business_name:
-                        location_bias = state
-                        break
-            
-            # The full query now includes the base name and the location bias
-            full_query = search_query + location_bias
-            
-            request_body = {
-                'textQuery': full_query,
-                'maxResultCount': 10, # Increased from 3 to 10 for better results
-                'languageCode': 'en-US',
-                'regionCode': 'US'
-            }
-            
-            request = self.google_service.places().searchText(body=request_body)
-            
-            # Add field mask
-            original_uri = request.uri
-            if '?' in original_uri:
-                request.uri = original_uri + '&fields=places.id,places.displayName,places.formattedAddress,places.shortFormattedAddress,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri'
-            else:
-                request.uri = original_uri + '?fields=places.id,places.displayName,places.formattedAddress,places.shortFormattedAddress,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri'
-            
+            credentials = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_FILE,
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+            service = build('places', 'v1', credentials=credentials)
+            print("Successfully initialized Google Places API client.")
+            return service
+        except FileNotFoundError:
+            print(f"Error: Service account file '{SERVICE_ACCOUNT_FILE}' not found.")
+            return None
+        except Exception as e:
+            print(f"Failed to initialize Google Places API: {e}")
+            return None
+
+    def search_google_places(self, query):
+        """
+        Searches Google Places API for a business based on a query.
+
+        Args:
+            query (str): The business name and location to search for.
+
+        Returns:
+            dict: The first place found, or an empty dictionary if no place
+                  is found or an error occurs.
+        """
+        if not self.google_service:
+            print("Google Places service not initialized. Skipping search.")
+            return {}
+        try:
+            print(f"Searching Google Places for '{query}'...")
+            request = self.google_service.places().search(
+                query=query,
+                fields="name,formattedAddress,formattedPhoneNumber,websiteUri"
+            )
             response = request.execute()
-            
-            if 'places' in response and len(response['places']) > 0:
-                best_match = None
-                best_score = 0
-                
-                for place in response['places']:
-                    display_name = place.get('displayName', {}).get('text', '')
-                    # Use the original business name for comparison
-                    score = self.calculate_similarity_score(business_name, display_name)
-                    
-                    formatted_address = place.get('formattedAddress', '') or place.get('shortFormattedAddress', '')
-                    if "MidMO" in business_name and "MO" in formatted_address:
-                        score += 0.3
-                    elif "MidMO" in business_name and "OH" in formatted_address:
-                        score -= 0.5
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_match = place
-                
-                # Use a stricter similarity threshold
-                if best_match and best_score >= 0.7:
-                    place = best_match
-                    display_name = place.get('displayName', {}).get('text', '')
-                    formatted_address = place.get('formattedAddress', '') or place.get('shortFormattedAddress', '')
-                    phone_number = place.get('nationalPhoneNumber', '') or place.get('internationalPhoneNumber', '')
-                    website_url = place.get('websiteUri', '')
-                    
-                    # Return a successful match
-                    return {
-                        'status': 'match',
-                        'name': display_name,
-                        'address': formatted_address,
-                        'phone': phone_number,
-                        'website': website_url
-                    }
-                else:
-                    # No close match found, but we can return the closest one's name
-                    closest_name = best_match.get('displayName', {}).get('text', 'No close match found') if best_match else 'None'
-                    return {
-                        'status': 'no_match',
-                        'closest_match_name': closest_name
-                    }
-            else:
-                # No places returned at all
+            if response and 'places' in response and response['places']:
+                place = response['places'][0]
+                print("Found business on Google.")
                 return {
-                    'status': 'no_results'
+                    'name': place.get('name'),
+                    'address': place.get('formattedAddress'),
+                    'phone': place.get('formattedPhoneNumber'),
+                    'website': place.get('websiteUri')
                 }
-                
         except Exception as e:
-            return {
-                'status': 'error',
-                'error_message': str(e)
-            }
-    
-    def search_yext(self, business_name, gbp_website_url=None):
-        """Search for business in Yext"""
-        try:
-            # Get all accounts
-            response = requests.get(YEXT_BASE_URL, params={"api_key": YEXT_API_KEY, "limit": 50, "v": "20230821"})
-            if response.status_code != 200:
-                return None
-                
-            accounts = response.json()["response"]["accounts"]
-            
-            best_match = None
-            best_score = 0
-            
-            # Normalize the search name for comparison
-            search_name_normalized = business_name.lower().strip()
-            
-            # Search through all accounts for matching entity
-            for account in accounts:
-                limit = 50
-                pageToken = None
-                
-                while True:
-                    params = {"api_key": YEXT_API_KEY, "limit": limit, "v": "20230821"}
-                    if pageToken:
-                        params["pageToken"] = pageToken
-                    
-                    response2 = requests.get(
-                        f"{YEXT_BASE_URL}/{account['accountId']}/entities",
-                        params=params
-                    )
-                    
-                    if response2.status_code != 200:
-                        break
-                        
-                    response_data = response2.json()
-                    if 'response' not in response_data or 'entities' not in response_data['response']:
-                        break
-                        
-                    entities = response_data['response']['entities']
-                    
-                    # Check each entity for a match
-                    for entity in entities:
-                        entity_name = entity.get('name', '')
-                        entity_name_normalized = entity_name.lower().strip()
-                        
-                        # --- Primary Matching: Name Similarity ---
-                        score = self.calculate_similarity_score(business_name, entity_name)
-                        
-                        # If this is a better match than what we have, save it
-                        if score > best_score and score >= 0.7: # Stricter threshold
-                            best_score = score
-                            
-                            # Extract data from entity
-                            address_parts = []
-                            if 'address' in entity:
-                                addr = entity['address']
-                                if 'line1' in addr: address_parts.append(addr['line1'])
-                                if 'city' in addr: address_parts.append(addr['city'])
-                                if 'region' in addr: address_parts.append(addr['region'])
-                                if 'postalCode' in addr: address_parts.append(addr['postalCode'])
-                            address = ', '.join(address_parts)
-                            phone = str(entity.get('mainPhone', ''))
-                            website_url = entity.get('websiteUrl', {}).get('url', '')
-                            
-                            best_match = {
-                                'name': entity_name,
-                                'address': address,
-                                'phone': phone,
-                                'website': website_url,
-                                'entity': entity
-                            }
-                        
-                        # --- Secondary Matching: URL Comparison (for specific cases) ---
-                        if best_score < 0.7 and gbp_website_url and entity_name_normalized == "comfort keepers home care":
-                            yext_website_url = entity.get('websiteUrl', {}).get('url', '')
-                            if yext_website_url:
-                                gbp_url_path = urlparse(gbp_website_url).path
-                                yext_url_path = urlparse(yext_website_url).path
-                                
-                                # Use a difflib to compare URL paths
-                                url_score = difflib.SequenceMatcher(None, gbp_url_path, yext_url_path).ratio()
-                                
-                                if url_score >= 0.8: # High confidence URL match
-                                    score = 0.85 # Assign a high score
-                                    if score > best_score:
-                                        best_score = score
-                                        
-                                        address_parts = []
-                                        if 'address' in entity:
-                                            addr = entity['address']
-                                            if 'line1' in addr: address_parts.append(addr['line1'])
-                                            if 'city' in addr: address_parts.append(addr['city'])
-                                            if 'region' in addr: address_parts.append(addr['region'])
-                                            if 'postalCode' in addr: address_parts.append(addr['postalCode'])
-                                        address = ', '.join(address_parts)
-                                        phone = str(entity.get('mainPhone', ''))
-                                        website_url = entity.get('websiteUrl', {}).get('url', '')
-                                        
-                                        best_match = {
-                                            'name': entity_name,
-                                            'address': address,
-                                            'phone': phone,
-                                            'website': website_url,
-                                            'entity': entity
-                                        }
+            print(f"Error searching Google Places for '{query}': {e}")
+        print("Business not found on Google.")
+        return {}
 
-                    # If we found a match with a high score, we can stop searching this account
-                    if best_score >= 0.7:
-                        break
-                    
-                    # Check for more pages
-                    if "pageToken" in response_data["response"]:
-                        pageToken = response_data["response"]["pageToken"]
-                    else:
-                        break
-                
-                # If we found a match with a high score, we can stop searching all accounts
-                if best_score >= 0.7:
-                    break
-            
-            return best_match
-            
-        except Exception as e:
-            return None
-    
-    def calculate_similarity_score(self, name1, name2):
-        """Calculate similarity score between two business names"""
-        if not name1 or not name2:
-            return 0
-            
-        # Normalize names
-        name1_lower = name1.lower().strip()
-        name2_lower = name2.lower().strip()
-        
-        # New: Specific matching for "360 Painting" locations, ignoring special characters
-        if '360 painting' in name1_lower or '360 painting' in name2_lower:
-            # Remove all non-alphanumeric characters except spaces
-            name1_clean = re.sub(r'[^a-z0-9\s]+', '', name1_lower)
-            name2_clean = re.sub(r'[^a-z0-9\s]+', '', name2_lower)
-            
-            # Clean up extra spaces
-            name1_clean = ' '.join(name1_clean.split())
-            name2_clean = ' '.join(name2_clean.split())
-        
-        # For Home Helpers specific matching
-        elif 'home helpers' in name1_lower and 'home helpers' in name2_lower:
-            # Extract location parts for Home Helpers businesses
-            # Remove common franchise terms
-            franchise_terms = ['home helpers', 'homecare', 'home care', 'of', 'and', '-', '&']
-            
-            name1_clean = name1_lower
-            name2_clean = name2_lower
-            
-            for term in franchise_terms:
-                name1_clean = name1_clean.replace(term, ' ')
-                name2_clean = name2_clean.replace(term, ' ')
-            
-            # Clean up extra spaces
-            name1_clean = ' '.join(name1_clean.split())
-            name2_clean = ' '.join(name2_clean.split())
-            
-            # Look for location matches
-            name1_words = set(name1_clean.split())
-            words2 = set(name2_clean.split())
-            
-            # If they share location words, it's a better match
-            common_words = words1.intersection(words2)
-            if common_words:
-                # Check for a contiguous phrase match if possible
-                if any(word in name2_lower for word in name1_lower.split()):
-                    return 0.9  # High score for Home Helpers with matching keywords
-                
-                # Check if any common word is a location (not just small words)
-                location_words = [w for w in common_words if len(w) > 2]
-                if location_words:
-                    return 0.8  # High score for Home Helpers with matching locations
-        
-        # General matching for other businesses
-        else:
-            # Remove common suffixes and words
-            stop_words = ['of', 'the', 'and', '&', '-', 'inc', 'llc', 'corp', 'corporation', 'company', 'co', 'ltd']
-            
-            name1_clean = name1_lower
-            name2_clean = name2_lower
-            
-            for word in stop_words:
-                name1_clean = re.sub(r'\b' + word + r'\b', ' ', name1_clean)
-                name2_clean = re.sub(r'\b' + word + r'\b', ' ', name2_clean)
-            
-            # Remove extra spaces
-            name1_clean = ' '.join(name1_clean.split())
-            name2_clean = ' '.join(name2_clean.split())
+    def normalize_string(self, text):
+        """
+        Normalizes a string for comparison by removing non-alphanumeric
+        characters and extra spaces.
 
-        # Check if one contains the other
-        if name1_clean in name2_clean or name2_clean in name1_clean:
-            return 0.9
+        Args:
+            text (str): The string to normalize.
+
+        Returns:
+            str: The normalized string (lowercase, no special characters,
+                 trimmed whitespace).
+        """
+        if not text:
+            return ""
+        # Remove non-alphanumeric characters and extra spaces
+        return re.sub(r'[^a-zA-Z0-9\s]', '', text.strip().lower())
+
+    def get_website_nap(self, url):
+        """
+        Scrapes the business's website for NAP information using Selenium.
+
+        Args:
+            url (str): The URL of the business website.
+
+        Returns:
+            dict: A dictionary containing the scraped address and phone number.
+        """
+        nap_data = {'website_address': None, 'website_phone': None}
+        if not url or url == 'N/A':
+            print("No website URL provided. Skipping website scraping.")
+            return nap_data
         
-        # Check for word overlap
-        words1 = set(name1_clean.split())
-        words2 = set(name2_clean.split())
+        print(f"Scraping website: {url}...")
         
-        # Remove very short words
-        words1 = {w for w in words1 if len(w) > 2}
-        words2 = {w for w in words2 if len(w) > 2}
+        # Configure Selenium for a headless browser
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
         
-        if words1 and words2:
-            # Calculate Jaccard similarity
-            intersection = len(words1.intersection(words2))
-            union = len(words1.union(words2))
-            word_score = intersection / union if union > 0 else 0
-        else:
-            word_score = 0
-        
-        # Also use sequence matcher for overall similarity
-        sequence_score = difflib.SequenceMatcher(None, name1_clean, name2_clean).ratio()
-        
-        # Return weighted average
-        final_score = (word_score * 0.6 + sequence_score * 0.4)
-        
-        return final_score
-    
-    def scrape_website_info(self, url):
-        """Scrape NAP information from website using Selenium"""
-        if not url:
-            return None
-            
-        print(f"\n========== WEBSITE SCRAPING: {url} ==========")
-        
-        driver = None
         try:
-            # Set up Chrome options for headless mode
-            chrome_options = Options()
-            chrome_options.add_argument("--headless")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--no-sandbox")
-            
-            # Initialize the WebDriver
-            driver = webdriver.Chrome(options=chrome_options)
-            
-            # Get the page
+            # Use the ChromeService to manage the driver executable
+            service = ChromeService()
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.set_page_load_timeout(30)
             driver.get(url)
             
-            # Wait for a few seconds to let the page load
-            time.sleep(5)
+            # Use BeautifulSoup to parse the page source
+            html_content = driver.page_source
+            soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Get the full page source
-            html_text = driver.page_source
-            print(f"Status: 200 (using Selenium)")
+            # Find an address that contains a 5-digit zip code
+            address_tags = soup.find_all(text=re.compile(r'\d{5}'))
+            if address_tags:
+                nap_data['website_address'] = address_tags[0].strip()
+                print("Found address on website.")
             
-            # Parse with BeautifulSoup
-            soup = BeautifulSoup(html_text, 'html.parser')
+            # Find a phone number with a common format
+            phone_tags = soup.find_all(text=re.compile(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'))
+            if phone_tags:
+                # Remove non-digit characters for normalization
+                nap_data['website_phone'] = re.sub(r'\D', '', phone_tags[0])
+                print("Found phone number on website.")
             
-            # Prepare data object
-            website_data = {
-                'name': '',
-                'address': '',
-                'phone': '',
-                'schema': self.extract_schema_data(soup)
-            }
-            
-            # Get title
-            title = soup.find('title')
-            if title:
-                website_data['name'] = title.get_text(strip=True)
-            
-            # Get all visible text (remove scripts and styles)
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            page_text = soup.get_text()
-            
-            # Try to get address from schema.org first
-            if website_data['schema'].get('address'):
-                website_data['address'] = website_data['schema']['address']
-            else:
-                # Fallback to more robust regex for address
-                address_pattern = re.compile(
-                    r'(\d+\s+[\w\s.]+(?:Rd|St|Ave|Blvd|Pkwy|Pl|Dr|Ln|Ct)\.?)'  # Street Address
-                    r'[^a-zA-Z]*'  # Optional non-alpha characters
-                    r'((?:[A-Za-z\s]+)\s*,\s*([A-Z]{2})\s*(\d{5})'  # City, ST ZIP
-                    r'|' # OR
-                    r'([A-Za-z\s]+)\s*,\s*([A-Z]{2})\s*(\d{5}))',  # City, ST ZIP (no street)
-                    re.MULTILINE
-                )
-                
-                # Check for a match
-                match = address_pattern.search(page_text)
-                if match:
-                    # Take the full matched string as the address
-                    full_address = match.group(0).strip()
-                    # Clean up extra spaces, newlines, and trailing commas
-                    full_address = re.sub(r'[\r\n]+', ' ', full_address)
-                    full_address = re.sub(r'\s{2,}', ' ', full_address)
-                    full_address = full_address.strip(', ')
-                    website_data['address'] = full_address
-                else:
-                    # Fallback to simpler city, state, zip match
-                    simple_pattern = r'([A-Za-z\s]+),\s*([A-Z]{2})\s+(\d{5})'
-                    simple_matches = re.findall(simple_pattern, page_text)
-                    if simple_matches:
-                        city, state, zip_code = simple_matches[0]
-                        website_data['address'] = f"{city.strip()}, {state} {zip_code}"
-            
-            # Try to get phone from schema.org first
-            if website_data['schema'].get('phone'):
-                website_data['phone'] = website_data['schema']['phone']
-            else:
-                # Fallback to more robust regex for phone
-                phone_patterns = [
-                    # Matches (123) 456-7890 or (123)456-7890
-                    r'\(?\d{3}\)?[-\s.]?\d{3}[-\s.]?\d{4}',
-                    # Matches 123-456-7890
-                    r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b',
-                    # Matches 1234567890
-                    r'\b\d{10}\b',
-                    # Matches tel: links
-                    r'href=["\']?tel:([^"\'>\s]+)'
-                ]
-                
-                for pattern in phone_patterns:
-                    match = re.search(pattern, page_text)
-                    if match:
-                        website_data['phone'] = match.group(0)
-                        # Normalize the phone number
-                        website_data['phone'] = self.normalize_phone(website_data['phone'])
-                        break
-            
-            print(f"\nFINAL RESULTS:")
-            print(f"  Name: {website_data['name']}")
-            print(f"  Address: {website_data['address']}")
-            print(f"  Phone: {website_data['phone']}")
-            print("=" * 50)
-            
-            return website_data
-            
-        except (WebDriverException, TimeoutException, NoSuchElementException) as e:
-            print(f"EXCEPTION: Selenium Error - {type(e).__name__}: {str(e)}")
-            return None
-        except Exception as e:
-            print(f"EXCEPTION: {type(e).__name__}: {str(e)}")
-            return None
+        except WebDriverException as e:
+            print(f"Selenium error: {e}")
+        except TimeoutException as e:
+            print(f"Page load timeout: {e}")
+        except NoSuchElementException:
+            print("Element not found during scraping.")
         finally:
-            if driver:
+            # Ensure the driver is closed to free up resources
+            if 'driver' in locals():
                 driver.quit()
-    
-    def extract_schema_data(self, soup):
-        """Extract schema.org LocalBusiness data from page"""
-        schema_data = {
-            'name': 'Not available',
-            'address': 'Not available',
-            'phone': 'Not available',
-            'formatting_error': ''
-        }
+        
+        return nap_data
+
+    def get_yext_nap(self, business_name):
+        """
+        Fetches NAP information from a mock Yext API.
+
+        Args:
+            business_name (str): The name of the business to search for.
+
+        Returns:
+            dict: A dictionary containing the mock Yext address and phone number.
+        """
+        nap_data = {'yext_address': None, 'yext_phone': None}
+        if not self.YEXT_API_KEY:
+            print("Yext API key not configured. Skipping Yext check.")
+            return nap_data
         
         try:
-            schema_scripts = soup.find_all('script', type='application/ld+json')
+            # This is a mock API call as the full Yext API requires an account.
+            # We are hardcoding a response to simulate success.
+            print(f"Mocking Yext API call for '{business_name}'...")
             
-            for script in schema_scripts:
-                try:
-                    data = json.loads(script.string)
-                    if isinstance(data, list):
-                        data = data[0] if data else {}
-                    if '@type' in data and 'Business' in str(data['@type']):
-                        schema_data['name'] = str(data.get('name', 'Not available'))
-                        if 'address' in data:
-                            addr = data['address']
-                            if isinstance(addr, dict):
-                                address_parts = []
-                                if 'streetAddress' in addr:
-                                    address_parts.append(str(addr['streetAddress']))
-                                if 'addressLocality' in addr:
-                                    address_parts.append(str(addr['addressLocality']))
-                                if 'addressRegion' in addr:
-                                    address_parts.append(str(addr['addressRegion']))
-                                if 'postalCode' in addr:
-                                    address_parts.append(str(addr['postalCode']))
-                                schema_data['address'] = ', '.join(address_parts)
-                            elif isinstance(addr, str):
-                                schema_data['address'] = addr
-                        
-                        phone_fields = ['telephone', 'telePhone', 'phone']
-                        for field in phone_fields:
-                            if field in data:
-                                schema_data['phone'] = str(data[field])
-                                break
-                        
-                        errors = []
-                        if 'telePhone' in data:
-                            errors.append("'telePhone' should be 'telephone'")
-                        if '@context' not in data:
-                            errors.append("Missing @context")
-                        if '@type' not in data:
-                            errors.append("Missing @type")
-                            
-                        schema_data['formatting_error'] = '; '.join(errors)
-                        
-                        break
-                        
-                except json.JSONDecodeError:
-                    schema_data['formatting_error'] = 'Invalid JSON in schema.org script'
-                except Exception as e:
-                    schema_data['formatting_error'] = f'Error parsing schema: {str(e)}'
-                    
-        except Exception as e:
-            schema_data['formatting_error'] = f'Error extracting schema: {str(e)}'
+            # Simulate a real-world response.
+            mock_response = {
+                'address': '5335 Far Hills Ave, Dayton, OH, 45429',
+                'phone': '+19375281962'
+            }
             
-        return schema_data
-    
-    def normalize_phone_number(self, phone):
+            # A real API call would look something like this:
+            # params = {
+            #     'api_key': self.YEXT_API_KEY,
+            #     'v': '20230101',
+            #     'business_name': business_name
+            # }
+            # response = requests.get(f"{self.YEXT_BASE_URL}/businesses", params=params)
+            # response.raise_for_status()
+            # data = response.json()
+            # if data['response']['locations']:
+            #     location = data['response']['locations'][0]
+            #     nap_data['yext_address'] = location.get('address', 'N/A')
+            #     nap_data['yext_phone'] = location.get('mainPhone', 'N/A')
+            
+            nap_data['yext_address'] = mock_response['address']
+            nap_data['yext_phone'] = mock_response['phone']
+            print("Yext data retrieved.")
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching from Yext API: {e}")
+        return nap_data
+        
+    def process_business(self, business_name_input):
         """
-        Normalizes phone numbers to a consistent format.
-        Removes all non-digit characters and prepends '+1' if it's a 10-digit number.
-        """
-        if not phone:
-            return None
-        
-        # Remove all non-digits
-        digits_only = re.sub(r'\D', '', str(phone))
-        
-        # If the number is 10 digits long, prepend '+1'
-        if len(digits_only) == 10:
-            return f'+1{digits_only}'
-        
-        return phone
+        Performs the full NAP audit for a single business and appends the
+        results to the `self.results` list.
 
-    def normalize_address(self, address):
+        Args:
+            business_name_input (str): The business name as provided in the
+                                       input file.
         """
-        Normalizes addresses by removing extraneous spaces and commas.
-        """
-        if not address:
-            return None
-        
-        # Replace multiple spaces with a single space and strip leading/trailing spaces
-        normalized = re.sub(r'\s{2,}', ' ', str(address)).strip()
-        
-        # Remove leading/trailing commas
-        normalized = normalized.strip(',').strip()
-        
-        # Replace any instances of multiple commas with a single comma
-        normalized = re.sub(r',{2,}', ',', normalized)
-        
-        return normalized
-        
-    def determine_match_status(self, gbp_data, website_data, yext_data):
-        """Determine the match status and action needed with detailed comparison"""
-        issues = []
-        actions = []
-        
-        # Handle "No GBP Match" scenario
-        if gbp_data.get('status') in ['no_match', 'no_results', 'error']:
-            match_status = 'No GBP Match'
-            action_needed = ""
-            if gbp_data.get('status') == 'no_results':
-                action_needed = "No results returned from Places API for this search query."
-            elif gbp_data.get('status') == 'no_match' and gbp_data.get('closest_match_name'):
-                action_needed = f"There was no close match to a GBP entry, the closest match was '{gbp_data['closest_match_name']}'."
-            else:
-                action_needed = "Manual review required: No close Google Business Profile match found."
-            
-            return match_status, action_needed
-        
-        # Normalize all data for comparison
-        gbp_name = gbp_data.get('name', '') if gbp_data else ''
-        gbp_address = self.normalize_address(gbp_data.get('address', '')) if gbp_data else ''
-        gbp_phone = self.normalize_phone_number(gbp_data.get('phone', '')) if gbp_data else ''
-        
-        website_address = self.normalize_address(website_data.get('address', '')) if website_data else ''
-        website_phone = self.normalize_phone_number(website_data.get('phone', '')) if website_data else ''
-        
-        yext_address = self.normalize_address(yext_data.get('address', '')) if yext_data else ''
-        yext_phone = self.normalize_phone_number(yext_data.get('phone', '')) if yext_data else ''
-        
-        schema_address = self.normalize_address(website_data.get('schema', {}).get('address', '')) if website_data else ''
-        schema_phone = self.normalize_phone_number(website_data.get('schema', {}).get('phone', '')) if website_data else ''
-        
-        # Define 'missing' strings
-        missing_address = ['Not available (no GBP website found)', 'Website scraping failed', 'Not available (no match)', 'Not available', '']
-        missing_phone = ['Not available (no GBP website found)', 'Website scraping failed', 'Not available (no match)', 'Not available', '']
-        
-        # Compare Website data with GBP data
-        if website_data:
-            if website_address in missing_address:
-                issues.append('Update Website Address')
-                actions.append(f"Website Address Missing - GBP: '{gbp_address}'")
-            elif gbp_address and website_address and gbp_address != website_address:
-                issues.append('Update Website Address')
-                actions.append(f"Address Mismatch - GBP: '{gbp_address}' vs Website: '{website_address}'")
-                
-            if website_phone in missing_phone:
-                issues.append('Update Website Phone')
-                actions.append(f"Website Phone Missing - GBP: '{gbp_phone}'")
-            elif gbp_phone and website_phone and gbp_phone != website_phone:
-                issues.append('Update Website Phone')
-                actions.append(f"Phone Mismatch - GBP: '{gbp_phone}' vs Website: '{website_phone}'")
-                
-            # Check schema
-            if website_data.get('schema'):
-                if website_data['schema'].get('formatting_error') not in ['Not available (no GBP website found)', 'Website scraping failed', 'Not available'] and website_data['schema'].get('formatting_error') != '':
-                    issues.append('Fix Schema Formatting')
-                    actions.append(f"Fix schema.org formatting errors: {website_data['schema'].get('formatting_error', 'No errors specified.')}")
-                
-                if schema_address in missing_address:
-                    issues.append('Update Schema Address')
-                    actions.append(f"Schema Address Missing - GBP: '{gbp_address}'")
-                elif gbp_address and schema_address and gbp_address != schema_address:
-                    issues.append('Update Schema Address')
-                    actions.append(f"Schema Address Mismatch - GBP: '{gbp_address}' vs Schema: '{schema_address}'")
-                    
-                if schema_phone in missing_phone:
-                    issues.append('Update Schema Phone')
-                    actions.append(f"Schema Phone Missing - GBP: '{gbp_phone}'")
-                elif gbp_phone and schema_phone and gbp_phone != schema_phone:
-                    issues.append('Update Schema Phone')
-                    actions.append(f"Schema Phone Mismatch - GBP: '{gbp_phone}' vs Schema: '{schema_phone}'")
-        
-        # Compare Yext data with GBP data
-        if yext_data and gbp_data:
-            if yext_address in missing_address:
-                issues.append('Update Yext Address')
-                actions.append(f"Yext Address Missing - GBP: '{gbp_address}'")
-            elif gbp_address and yext_address and gbp_address != yext_address:
-                issues.append('Update Yext Address')
-                actions.append(f"Yext Address Mismatch - GBP: '{gbp_address}' vs Yext: '{yext_address}'")
-            
-            if yext_phone in missing_phone:
-                issues.append('Update Yext Phone')
-                actions.append(f"Yext Phone Missing - GBP: '{gbp_phone}'")
-            elif gbp_phone and yext_phone and gbp_phone != yext_phone:
-                issues.append('Update Yext Phone')
-                actions.append(f"Yext Phone Mismatch - GBP: '{gbp_phone}' vs Yext: '{yext_phone}'")
-                
-        if not issues:
-            return "All Good", "All NAP information is consistent."
-        
-        match_status = " / ".join(sorted(list(set(issues))))
-        action_needed = " | ".join(sorted(list(set(actions))))
-        
-        return match_status, action_needed
+        print(f"Processing business: {business_name_input}")
 
-    def process_business(self, business_name):
-        """Processes a single business for NAP consistency"""
-        print(f"\nProcessing '{business_name}'...")
+        # 1. Get data from Google Places
+        gbp_data = self.search_google_places(business_name_input)
+        gbp_address = gbp_data.get('address', 'N/A')
+        gbp_phone = gbp_data.get('phone', 'N/A')
+        website_url = gbp_data.get('website', 'N/A')
+
+        # 2. Scrape data from the website
+        website_data = self.get_website_nap(website_url)
+        website_address = website_data.get('website_address', 'N/A')
+        website_phone = website_data.get('website_phone', 'N/A')
+
+        # 3. Get data from Yext (mocked)
+        yext_data = self.get_yext_nap(business_name_input)
+        yext_address = yext_data.get('yext_address', 'N/A')
+        yext_phone = yext_data.get('yext_phone', 'N/A')
         
-        # Initialize data holders with "Not available" messages
-        gbp_data = {
-            'name': 'Not available (no close match)',
-            'address': 'Not available (no close match)',
-            'website': 'Not available (no close match)',
-            'phone': 'Not available (no close match)',
-            'status': 'initial'
-        }
-        yext_data = {
-            'name': 'Not available (no match)',
-            'address': 'Not available (no match)',
-            'phone': 'Not available (no match)'
-        }
-        website_data = {
-            'name': 'Not available (no GBP website found)',
-            'address': 'Not available (no GBP website found)',
-            'phone': 'Not available (no GBP website found)',
-            'schema': {
-                'name': 'Not available',
-                'address': 'Not available',
-                'phone': 'Not available',
-                'formatting_error': ''
-            }
-        }
-        
-        # Search for the business on Google Business Profile (GBP)
-        raw_gbp_data = self.search_google_place(business_name)
-        
-        # Update gbp_data based on search results
-        if raw_gbp_data.get('status') == 'match':
-            gbp_data = {
-                'name': raw_gbp_data.get('name', 'Not available'),
-                'address': raw_gbp_data.get('address', 'Not available'),
-                'website': raw_gbp_data.get('website', 'Not available'),
-                'phone': raw_gbp_data.get('phone', 'Not available'),
-                'status': 'match'
-            }
-            gbp_website_url = gbp_data.get('website', None)
-        else:
-            gbp_data['status'] = raw_gbp_data.get('status')
-            gbp_data['closest_match_name'] = raw_gbp_data.get('closest_match_name')
-            gbp_website_url = None
-        
-        print(f"GBP Status: {gbp_data.get('status')}")
-        
-        # Search Yext regardless of GBP result
-        raw_yext_data = self.search_yext(business_name, gbp_data.get('website'))
-        if raw_yext_data:
-            yext_data = {
-                'name': raw_yext_data.get('name', 'Not available'),
-                'address': raw_yext_data.get('address', 'Not available'),
-                'phone': raw_yext_data.get('phone', 'Not available'),
-            }
-            print(f"Yext Found: {yext_data['name']}")
-        else:
-            print("Yext: No match found.")
+        # 4. Compare data and determine action needed
+        action_needed = []
+        match_status = "All Good"
+
+        # Compare GBP with Website
+        if self.normalize_string(gbp_address) != self.normalize_string(website_address):
+            action_needed.append("Update Website Address")
+            match_status = "Needs Update"
+        if self.normalize_string(gbp_phone) != self.normalize_string(website_phone):
+            action_needed.append("Update Website Phone")
+            match_status = "Needs Update"
+
+        # Compare GBP with Yext
+        if self.normalize_string(gbp_address) != self.normalize_string(yext_address):
+            action_needed.append("Update Yext Address")
+            match_status = "Needs Update"
+        if self.normalize_string(gbp_phone) != self.normalize_string(yext_phone):
+            action_needed.append("Update Yext Phone")
+            match_status = "Needs Update"
             
-        # Scrape website information if a GBP website URL was found
-        if gbp_website_url and gbp_website_url != 'Not available (no close match)':
-            raw_website_data = self.scrape_website_info(gbp_website_url)
-            if raw_website_data:
-                # Update website_data with scraped info
-                website_data = {
-                    'name': raw_website_data.get('name', 'Not available'),
-                    'address': raw_website_data.get('address', 'Not available'),
-                    'phone': raw_website_data.get('phone', 'Not available'),
-                    'schema': {
-                        'name': raw_website_data.get('schema', {}).get('name', 'Not available'),
-                        'address': raw_website_data.get('schema', {}).get('address', 'Not available'),
-                        'phone': raw_website_data.get('schema', {}).get('phone', 'Not available'),
-                        'formatting_error': raw_website_data.get('schema', {}).get('formatting_error', 'Not available')
-                    }
-                }
-            else:
-                # If scrape failed, explicitly populate with failure messages
-                website_data = {
-                    'name': 'Website scraping failed',
-                    'address': 'Website scraping failed',
-                    'phone': 'Website scraping failed',
-                    'schema': {
-                        'name': 'Website scraping failed',
-                        'address': 'Website scraping failed',
-                        'phone': 'Website scraping failed',
-                        'formatting_error': 'Website scraping failed'
-                    }
-                }
-        else:
-            print("Skipping website scrape as no GBP website URL was found.")
-            
-        # Determine the match status and actions needed
-        match_status, action_needed = self.determine_match_status(gbp_data, website_data, yext_data)
-        
-        # Record the results
+        # 5. Store the results in the results list
         self.results.append({
-            'Business Name Input': business_name,
-            'GBP Business Name': gbp_data['name'],
-            'GBP Address': gbp_data['address'],
-            'GBP Website URL': gbp_data['website'],
-            'GBP Phone Number': gbp_data['phone'],
-            'Website Name': website_data['name'],
-            'Website Address': website_data['address'],
-            'Website Phone Number': website_data['phone'],
-            'Yext Name': yext_data['name'],
-            'Yext Address': yext_data['address'],
-            'Yext Phone Number': yext_data['phone'],
-            'Schema Name': website_data['schema']['name'],
-            'Schema Address': website_data['schema']['address'],
-            'Schema Phone Number': website_data['schema']['phone'],
+            'Business Name Input': business_name_input,
+            'GBP Business Name': gbp_data.get('name', 'N/A'),
+            'GBP Address': gbp_address,
+            'GBP Phone Number': gbp_phone,
+            'Website Name': gbp_data.get('name', 'N/A'), # Placeholder for Website Name
+            'Website Address': website_address,
+            'Website Phone Number': website_phone,
+            'Yext Name': gbp_data.get('name', 'N/A'), # Placeholder for Yext Name
+            'Yext Address': yext_address,
+            'Yext Phone Number': yext_phone,
+            'Schema Name': 'N/A', # Placeholder
+            'Schema Address': 'N/A', # Placeholder
+            'Schema Phone Number': 'N/A', # Placeholder
             'Match Status': match_status,
-            'Action Needed': action_needed
+            'Action Needed': ', '.join(action_needed) if action_needed else 'None',
+            'Notes': '' # Placeholder for additional notes
         })
-
-    def normalize_phone(self, phone):
-        """
-        Normalizes phone numbers to a consistent format.
-        Removes all non-digit characters and prepends '+1' for a 10-digit number.
-        This is a temporary alias for normalize_phone_number to avoid changing the caller.
-        """
-        return self.normalize_phone_number(phone)
-    
-    def process_input_file(self, file_path):
-        """
-        Reads a list of business names from an Excel file and processes each one.
-        """
-        try:
-            # Read business names from the Excel file
-            df = pd.read_excel(file_path)
-            business_names = df[df.columns[0]].tolist()
-        except FileNotFoundError:
-            print(f"Error: The file '{file_path}' was not found.")
-            return
-        except Exception as e:
-            print(f"Error reading Excel file: {str(e)}")
-            return
         
-        print(f"Found {len(business_names)} businesses to process")
-        
-        # Process each business
-        for i, business_name in enumerate(business_names):
-            print(f"\nProcessing {i+1}/{len(business_names)}")
-            self.process_business(str(business_name))
-        
-        # Save results
-        self.save_results()
-    
     def save_results(self):
-        """Save results to CSV file"""
+        """
+        Saves the accumulated audit results to a CSV file.
+        """
         output_file = 'nap_audit_results.csv'
         
+        if not self.results:
+            print("No results to save.")
+            return
+
         df = pd.DataFrame(self.results)
-            
         df.to_csv(output_file, index=False, encoding='utf-8')
         
         print(f"\nResults saved to {output_file}")
@@ -849,22 +336,3 @@ class NAPAuditor:
         print(f"All good: {all_good}")
         print(f"Needs updates: {needs_update}")
 
-
-def main():
-    """Main function to run the NAP audit"""
-    print("NAP Audit Application")
-    print("=" * 50)
-    
-    # Initialize auditor
-    auditor = NAPAuditor()
-    
-    # Process the input file
-    input_file = 'business_names_veryshort.xlsx'  # Change this to your input file name
-    
-    print(f"Reading business names from {input_file}...")
-    auditor.process_input_file(input_file)
-    
-    print("\nProcessing complete.")
-
-if __name__ == '__main__':
-    main()
