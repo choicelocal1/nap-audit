@@ -13,8 +13,9 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# Initialize Celery
-app = Celery('tasks', broker=os.environ.get('REDIS_URL', 'redis://localhost:6379'))
+# Initialize Celery with Redis as both broker and backend
+redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+app = Celery('tasks', broker=redis_url, backend=redis_url)
 
 # Configure Celery
 app.conf.update(
@@ -26,6 +27,7 @@ app.conf.update(
     task_track_started=True,
     task_time_limit=3600,  # 1 hour max per task
     task_soft_time_limit=3500,  # 58 minutes soft limit
+    result_expires=3600,  # Results expire after 1 hour
 )
 
 # Load SMTP configuration
@@ -85,9 +87,25 @@ def process_audit_batch(self, batch_data):
                 # Add error result
                 results.append({
                     'Business Name Input': business_name,
+                    'GBP Business Name': 'Error',
+                    'GBP Address': 'Error',
+                    'GBP Website URL': 'Error',
+                    'GBP Phone Number': 'Error',
+                    'Website Name': 'Error',
+                    'Website Address': 'Error',
+                    'Website Phone Number': 'Error',
+                    'Yext Name': 'Error',
+                    'Yext Address': 'Error',
+                    'Yext Phone Number': 'Error',
+                    'Schema Name': 'Error',
+                    'Schema Address': 'Error',
+                    'Schema Phone Number': 'Error',
                     'Match Status': 'Error',
                     'Action Needed': f'Error during processing: {str(e)}'
                 })
+        
+        # Add any error results to auditor results
+        auditor.results.extend(results)
         
         # Return the results for this batch
         return {
@@ -131,7 +149,7 @@ def combine_and_send_results(batch_results, email_address, output_filename_prefi
         # Calculate statistics
         total_processed = len(all_results)
         all_good_count = sum(1 for r in all_results if r.get('Match Status') == 'All Good')
-        needs_update_count = total_processed - all_good_count
+        needs_update_count = sum(1 for r in all_results if r.get('Match Status') not in ['All Good', 'Error'])
         error_count = sum(1 for r in all_results if r.get('Match Status') == 'Error')
         
         # Send email

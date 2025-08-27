@@ -18,7 +18,6 @@ from flask import Flask, request, jsonify
 from urllib.parse import urlparse
 from io import StringIO
 from celery import Celery, chord
-from tasks import process_audit_batch, combine_and_send_results
 
 # =========================================================================
 # FLASK APPLICATION SETUP
@@ -26,8 +25,9 @@ from tasks import process_audit_batch, combine_and_send_results
 
 app = Flask(__name__)
 
-# Initialize Celery
-celery = Celery('tasks', broker=os.environ.get('REDIS_URL', 'redis://localhost:6379'))
+# Initialize Celery with Redis as both broker and backend
+redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+celery = Celery('tasks', broker=redis_url, backend=redis_url)
 
 # Load configuration from environment variables
 SMTP_EMAIL = os.environ.get("SMTP_EMAIL")
@@ -39,6 +39,9 @@ API_PASSWORD = os.environ.get("API_PASSWORD")
 
 # Batch size for processing
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))  # Process 50 businesses per batch
+
+# Import tasks after Celery is configured
+from tasks import process_audit_batch, combine_and_send_results
 
 # =========================================================================
 # EMAIL SENDER
