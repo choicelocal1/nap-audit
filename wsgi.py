@@ -25,8 +25,13 @@ from celery import Celery, chord
 
 app = Flask(__name__)
 
-# Initialize Celery with Redis as both broker and backend
+# Initialize Celery with Redis configuration
 redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+
+# Fix for Heroku Redis SSL
+if redis_url.startswith('rediss://'):
+    redis_url += '?ssl_cert_reqs=CERT_NONE'
+
 celery = Celery('tasks', broker=redis_url, backend=redis_url)
 
 # Load configuration from environment variables

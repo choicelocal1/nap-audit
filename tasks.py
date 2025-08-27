@@ -13,8 +13,13 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# Initialize Celery with Redis as both broker and backend
+# Initialize Celery with Redis configuration
 redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+
+# Fix for Heroku Redis SSL
+if redis_url.startswith('rediss://'):
+    redis_url += '?ssl_cert_reqs=CERT_NONE'
+
 app = Celery('tasks', broker=redis_url, backend=redis_url)
 
 # Configure Celery
