@@ -3,6 +3,7 @@ import time
 import json
 import re
 import os
+import gc
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -385,13 +386,38 @@ class NAPAuditor:
         
         driver = None
         try:
-            # Set up Chrome options for headless mode
+            # Set up Chrome options for headless mode with memory optimizations
             chrome_options = Options()
             chrome_options.add_argument("--headless")
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--remote-debugging-port=9222")
+            
+            # Memory-saving options
+            chrome_options.add_argument("--disable-images")
+            chrome_options.add_argument("--disable-javascript")
+            chrome_options.add_argument("--memory-pressure-off")
+            chrome_options.add_argument("--disable-web-security")
+            chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+            chrome_options.add_argument("--disable-background-timer-throttling")
+            chrome_options.add_argument("--disable-renderer-backgrounding")
+            chrome_options.add_argument("--disable-features=TranslateUI")
+            chrome_options.add_argument("--disable-ipc-flooding-protection")
+            chrome_options.add_argument("--single-process")
+            chrome_options.add_argument("--no-zygote")
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-plugins")
+            chrome_options.add_argument("--disable-dev-tools")
+            chrome_options.add_argument("--disable-logging")
+            chrome_options.add_argument("--log-level=3")
+            
+            # Memory limits
+            chrome_options.add_argument("--js-heap-size=256")
+            chrome_options.add_argument("--memory-model=low")
+            
+            # Set page load strategy to eager (don't wait for all resources)
+            chrome_options.page_load_strategy = 'eager'
             
             # For Heroku deployment with Chrome for Testing
             chrome_options.binary_location = os.environ.get("GOOGLE_CHROME_BIN", "/app/.chrome-for-testing/chrome-linux64/chrome")
@@ -406,11 +432,14 @@ class NAPAuditor:
             else:
                 driver = webdriver.Chrome(options=chrome_options)
             
+            # Set timeout
+            driver.set_page_load_timeout(15)
+            
             # Get the page
             driver.get(url)
             
             # Wait for a few seconds to let the page load
-            time.sleep(5)
+            time.sleep(3)  # Reduced from 5 seconds
             
             # Get the full page source
             html_text = driver.page_source
@@ -510,7 +539,12 @@ class NAPAuditor:
             return None
         finally:
             if driver:
-                driver.quit()
+                try:
+                    driver.quit()
+                except:
+                    pass
+                # Force garbage collection
+                gc.collect()
     
     def extract_schema_data(self, soup):
         """Extract schema.org LocalBusiness data from page"""

@@ -9,6 +9,7 @@ import openpyxl
 import tempfile
 import smtplib
 import traceback
+import threading
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -139,6 +140,133 @@ def get_sheet_data(url):
         return None
 
 # =========================================================================
+# BACKGROUND AUDIT FUNCTION
+# =========================================================================
+
+def run_audit_async(data, email_address, request_data):
+    """Run the audit in the background"""
+    try:
+        google_sheet_url = data['url']
+        output_filename_prefix = data['filename']
+        
+        # Download the Google Sheet data
+        csv_data = get_sheet_data(google_sheet_url)
+        if not csv_data:
+            error_msg = "Failed to download Google Sheet. Check the URL and ensure the sheet is publicly accessible."
+            send_error_notification(
+                email_address, 
+                "Google Sheet Download Failed", 
+                error_msg,
+                request_data
+            )
+            return
+
+        # Read the business names from the downloaded CSV content
+        df = pd.read_csv(StringIO(csv_data))
+        business_names = df.iloc[:, 0].tolist()
+        
+        if not business_names:
+            error_msg = "No business names found in the spreadsheet."
+            send_error_notification(
+                email_address, 
+                "Empty Spreadsheet", 
+                error_msg,
+                request_data
+            )
+            return
+
+        # Run the audit
+        auditor = NAPAuditor()
+        total_businesses = len(business_names)
+        
+        for i, business_name in enumerate(business_names):
+            print(f"Processing {i+1}/{total_businesses}: {business_name}")
+            try:
+                auditor.process_business(str(business_name))
+                time.sleep(1) # Delay to avoid API rate limits
+            except Exception as e:
+                print(f"Error processing {business_name}: {str(e)}")
+                # Continue with other businesses even if one fails
+
+        # Save results to a temporary CSV file
+        csv_path = tempfile.NamedTemporaryFile(delete=False, suffix=".csv").name
+        if auditor.results:
+            output_df = pd.DataFrame(auditor.results)
+            output_df.to_csv(csv_path, index=False)
+        else:
+            error_msg = "NAP audit completed but no results were generated."
+            send_error_notification(
+                email_address, 
+                "No Results Generated", 
+                error_msg,
+                request_data
+            )
+            return
+
+        # Convert to Excel and create the specific filename
+        today_date = datetime.now().strftime('%m%d%Y')
+        output_filename = f"{output_filename_prefix}_{today_date}.xlsx"
+        temp_excel_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
+        pd.read_csv(csv_path).to_excel(temp_excel_path, index=False)
+        
+        # Read the created Excel file for email attachment
+        with open(temp_excel_path, "rb") as f:
+            file_data = f.read()
+
+        # Calculate summary statistics
+        total_processed = len(auditor.results)
+        all_good_count = sum(1 for r in auditor.results if r.get('Match Status') == 'All Good')
+        needs_update_count = total_processed - all_good_count
+
+        # Send the email with the Excel attachment
+        email_sent = send_email(
+            to_email=email_address,
+            subject="NAP Audit Results",
+            body=f"""Hello,
+
+Your NAP audit is complete. The results are attached.
+
+Audit Summary:
+- Total businesses processed: {total_processed}
+- All good: {all_good_count}
+- Needs updates: {needs_update_count}
+- Input file: {google_sheet_url}
+- Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+Thank you!
+NAP Audit System""",
+            attachment=file_data,
+            attachment_filename=output_filename
+        )
+        
+        # Clean up temporary files
+        try:
+            os.remove(csv_path)
+            os.remove(temp_excel_path)
+        except:
+            pass
+        
+        if not email_sent:
+            print(f"Failed to send results email to {email_address}")
+
+    except Exception as e:
+        error_msg = f"An unexpected error occurred: {str(e)}"
+        error_traceback = traceback.format_exc()
+        print(error_msg)
+        print(error_traceback)
+        
+        # Try to send error notification
+        try:
+            send_error_notification(
+                email_address, 
+                "Unexpected Error During Background Processing", 
+                f"{error_msg}\n\nTraceback:\n{error_traceback}",
+                request_data
+            )
+        except:
+            pass  # Don't let error notification failure crash the process
+
+# =========================================================================
 # API ENDPOINT
 # =========================================================================
 @app.route('/audit', methods=['POST'])
@@ -179,101 +307,19 @@ def run_audit_endpoint():
             )
             return jsonify({'error': f'Missing fields. Required fields are: {required_fields}'}), 400
 
-        google_sheet_url = data['url']
-        output_filename_prefix = data['filename']
-        
-        # 3. Download the Google Sheet data
-        csv_data = get_sheet_data(google_sheet_url)
-        if not csv_data:
-            error_msg = "Failed to download Google Sheet. Check the URL and ensure the sheet is publicly accessible."
-            send_error_notification(
-                email_address, 
-                "Google Sheet Download Failed", 
-                error_msg,
-                request_data
-            )
-            return jsonify({"status": "error", "message": error_msg}), 500
-
-        # 4. Read the business names from the downloaded CSV content
-        df = pd.read_csv(StringIO(csv_data))
-        business_names = df.iloc[:, 0].tolist()
-        
-        if not business_names:
-            error_msg = "No business names found in the spreadsheet."
-            send_error_notification(
-                email_address, 
-                "Empty Spreadsheet", 
-                error_msg,
-                request_data
-            )
-            return jsonify({"status": "error", "message": error_msg}), 400
-
-        # 5. Run the audit
-        auditor = NAPAuditor()
-        for i, business_name in enumerate(business_names):
-            print(f"Processing {i+1}/{len(business_names)}: {business_name}")
-            auditor.process_business(str(business_name))
-            time.sleep(1) # Delay to avoid API rate limits
-
-        # 6. Save results to a temporary CSV file
-        csv_path = tempfile.NamedTemporaryFile(delete=False, suffix=".csv").name
-        if auditor.results:
-            output_df = pd.DataFrame(auditor.results)
-            output_df.to_csv(csv_path, index=False)
-        else:
-            error_msg = "NAP audit completed but no results were generated."
-            send_error_notification(
-                email_address, 
-                "No Results Generated", 
-                error_msg,
-                request_data
-            )
-            return jsonify({"status": "error", "message": error_msg}), 500
-
-        # 7. Convert to Excel and create the specific filename
-        today_date = datetime.now().strftime('%m%d%Y')
-        output_filename = f"{output_filename_prefix}_{today_date}.xlsx"
-        temp_excel_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
-        pd.read_csv(csv_path).to_excel(temp_excel_path, index=False)
-        
-        # 8. Read the created Excel file for email attachment
-        with open(temp_excel_path, "rb") as f:
-            file_data = f.read()
-
-        # 9. Send the email with the Excel attachment
-        email_sent = send_email(
-            to_email=email_address,
-            subject="NAP Audit Results",
-            body=f"""Hello,
-
-Your NAP audit is complete. The results are attached.
-
-Audit Summary:
-- Total businesses processed: {len(auditor.results)}
-- Input file: {google_sheet_url}
-- Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
-
-Thank you!
-NAP Audit System""",
-            attachment=file_data,
-            attachment_filename=output_filename
+        # 3. Start the audit in a background thread
+        thread = threading.Thread(
+            target=run_audit_async, 
+            args=(data, email_address, request_data)
         )
+        thread.daemon = True
+        thread.start()
         
-        # 10. Clean up temporary files
-        os.remove(csv_path)
-        os.remove(temp_excel_path)
-        
-        if email_sent:
-            return jsonify({"status": "success", "message": f"Audit complete. Results sent to {email_address}."}), 200
-        else:
-            error_msg = "NAP audit completed, but failed to send the results via email. Check SMTP credentials."
-            send_error_notification(
-                email_address, 
-                "Email Send Failed", 
-                error_msg,
-                request_data
-            )
-            return jsonify({"status": "error", "message": error_msg}), 500
+        # 4. Return immediately
+        return jsonify({
+            "status": "accepted", 
+            "message": f"Audit started. Results will be sent to {email_address} when complete. This may take several minutes depending on the number of businesses."
+        }), 202
 
     except Exception as e:
         error_msg = f"An unexpected error occurred: {str(e)}"
