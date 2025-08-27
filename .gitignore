@@ -1,0 +1,12 @@
+# Ignore local credentials and sensitive files
+*.json
+
+# Ignore spreadsheet and data files
+*.xlsx
+*.csv
+
+# Ignore common Python files
+__pycache__/
+*.pyc
+.venv/
+venv/
