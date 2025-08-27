@@ -1,7 +1,8 @@
 Flask
+gunicorn
 pandas
 requests
-gunicorn
-openpyxl
 beautifulsoup4
 google-api-python-client
+openpyxl
+werkzeug
