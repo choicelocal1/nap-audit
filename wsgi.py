@@ -9,16 +9,16 @@ import openpyxl
 import tempfile
 import smtplib
 import traceback
-import threading
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 from datetime import datetime
 from flask import Flask, request, jsonify
-from nap import NAPAuditor # Import the NAPAuditor class
 from urllib.parse import urlparse
 from io import StringIO
+from celery import Celery, chord
+from tasks import process_audit_batch, combine_and_send_results
 
 # =========================================================================
 # FLASK APPLICATION SETUP
@@ -26,24 +26,26 @@ from io import StringIO
 
 app = Flask(__name__)
 
-# Load configuration from environment variables for security and Heroku deployment
+# Initialize Celery
+celery = Celery('tasks', broker=os.environ.get('REDIS_URL', 'redis://localhost:6379'))
+
+# Load configuration from environment variables
 SMTP_EMAIL = os.environ.get("SMTP_EMAIL")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 YEXT_API_KEY = os.environ.get("YEXT_API_KEY")
 YEXT_BASE_URL = os.environ.get("YEXT_BASE_URL")
-
-# Define the correct password as an environment variable for security
 API_PASSWORD = os.environ.get("API_PASSWORD")
+
+# Batch size for processing
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))  # Process 50 businesses per batch
 
 # =========================================================================
 # EMAIL SENDER
 # =========================================================================
 
 def send_email(to_email, subject, body, attachment=None, attachment_filename=None):
-    """
-    Sends an email with an optional attachment.
-    """
+    """Sends an email with an optional attachment."""
     if not all([SMTP_EMAIL, SMTP_PASSWORD, to_email]):
         print("SMTP configuration or recipient email is missing. Cannot send email.")
         return False
@@ -73,9 +75,7 @@ def send_email(to_email, subject, body, attachment=None, attachment_filename=Non
         return False
 
 def send_error_notification(email_address, error_type, error_details, request_data=None):
-    """
-    Send error notification email
-    """
+    """Send error notification email"""
     subject = f"NAP Audit Error: {error_type}"
     
     body = f"""Hello,
@@ -111,15 +111,7 @@ NAP Audit System"""
 # =========================================================================
 
 def get_sheet_data(url):
-    """
-    Downloads a Google Sheet as a CSV from a public URL.
-    
-    Args:
-        url (str): The Google Sheets URL.
-
-    Returns:
-        str or None: The CSV content as a string, or None on failure.
-    """
+    """Downloads a Google Sheet as a CSV from a public URL."""
     try:
         # Extract the spreadsheet ID from the URL
         parsed_url = urlparse(url)
@@ -133,154 +125,25 @@ def get_sheet_data(url):
         csv_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv"
         
         response = requests.get(csv_url)
-        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()
         return response.text
     except Exception as e:
         print(f"Error downloading Google Sheet: {e}")
         return None
 
 # =========================================================================
-# BACKGROUND AUDIT FUNCTION
-# =========================================================================
-
-def run_audit_async(data, email_address, request_data):
-    """Run the audit in the background"""
-    try:
-        google_sheet_url = data['url']
-        output_filename_prefix = data['filename']
-        
-        # Download the Google Sheet data
-        csv_data = get_sheet_data(google_sheet_url)
-        if not csv_data:
-            error_msg = "Failed to download Google Sheet. Check the URL and ensure the sheet is publicly accessible."
-            send_error_notification(
-                email_address, 
-                "Google Sheet Download Failed", 
-                error_msg,
-                request_data
-            )
-            return
-
-        # Read the business names from the downloaded CSV content
-        df = pd.read_csv(StringIO(csv_data))
-        business_names = df.iloc[:, 0].tolist()
-        
-        if not business_names:
-            error_msg = "No business names found in the spreadsheet."
-            send_error_notification(
-                email_address, 
-                "Empty Spreadsheet", 
-                error_msg,
-                request_data
-            )
-            return
-
-        # Run the audit
-        auditor = NAPAuditor()
-        total_businesses = len(business_names)
-        
-        for i, business_name in enumerate(business_names):
-            print(f"Processing {i+1}/{total_businesses}: {business_name}")
-            try:
-                auditor.process_business(str(business_name))
-                time.sleep(1) # Delay to avoid API rate limits
-            except Exception as e:
-                print(f"Error processing {business_name}: {str(e)}")
-                # Continue with other businesses even if one fails
-
-        # Save results to a temporary CSV file
-        csv_path = tempfile.NamedTemporaryFile(delete=False, suffix=".csv").name
-        if auditor.results:
-            output_df = pd.DataFrame(auditor.results)
-            output_df.to_csv(csv_path, index=False)
-        else:
-            error_msg = "NAP audit completed but no results were generated."
-            send_error_notification(
-                email_address, 
-                "No Results Generated", 
-                error_msg,
-                request_data
-            )
-            return
-
-        # Convert to Excel and create the specific filename
-        today_date = datetime.now().strftime('%m%d%Y')
-        output_filename = f"{output_filename_prefix}_{today_date}.xlsx"
-        temp_excel_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
-        pd.read_csv(csv_path).to_excel(temp_excel_path, index=False)
-        
-        # Read the created Excel file for email attachment
-        with open(temp_excel_path, "rb") as f:
-            file_data = f.read()
-
-        # Calculate summary statistics
-        total_processed = len(auditor.results)
-        all_good_count = sum(1 for r in auditor.results if r.get('Match Status') == 'All Good')
-        needs_update_count = total_processed - all_good_count
-
-        # Send the email with the Excel attachment
-        email_sent = send_email(
-            to_email=email_address,
-            subject="NAP Audit Results",
-            body=f"""Hello,
-
-Your NAP audit is complete. The results are attached.
-
-Audit Summary:
-- Total businesses processed: {total_processed}
-- All good: {all_good_count}
-- Needs updates: {needs_update_count}
-- Input file: {google_sheet_url}
-- Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
-
-Thank you!
-NAP Audit System""",
-            attachment=file_data,
-            attachment_filename=output_filename
-        )
-        
-        # Clean up temporary files
-        try:
-            os.remove(csv_path)
-            os.remove(temp_excel_path)
-        except:
-            pass
-        
-        if not email_sent:
-            print(f"Failed to send results email to {email_address}")
-
-    except Exception as e:
-        error_msg = f"An unexpected error occurred: {str(e)}"
-        error_traceback = traceback.format_exc()
-        print(error_msg)
-        print(error_traceback)
-        
-        # Try to send error notification
-        try:
-            send_error_notification(
-                email_address, 
-                "Unexpected Error During Background Processing", 
-                f"{error_msg}\n\nTraceback:\n{error_traceback}",
-                request_data
-            )
-        except:
-            pass  # Don't let error notification failure crash the process
-
-# =========================================================================
 # API ENDPOINT
 # =========================================================================
+
 @app.route('/audit', methods=['POST'])
 def run_audit_endpoint():
-    """
-    API endpoint to trigger the NAP audit.
-    It now expects a JSON payload with 'url', 'email', 'filename', and 'password'.
-    """
+    """API endpoint to trigger the NAP audit using Celery tasks."""
     request_data = {}
     
     try:
         data = request.get_json()
         request_data = data if data else {}
-        email_address = request_data.get('email', SMTP_EMAIL)  # Default to SMTP_EMAIL if not provided
+        email_address = request_data.get('email', SMTP_EMAIL)
         
         # 1. Validate the password
         if not data or 'password' not in data or data['password'] != API_PASSWORD:
@@ -307,18 +170,68 @@ def run_audit_endpoint():
             )
             return jsonify({'error': f'Missing fields. Required fields are: {required_fields}'}), 400
 
-        # 3. Start the audit in a background thread
-        thread = threading.Thread(
-            target=run_audit_async, 
-            args=(data, email_address, request_data)
-        )
-        thread.daemon = True
-        thread.start()
+        google_sheet_url = data['url']
+        output_filename_prefix = data['filename']
         
-        # 4. Return immediately
+        # 3. Download the Google Sheet data
+        csv_data = get_sheet_data(google_sheet_url)
+        if not csv_data:
+            error_msg = "Failed to download Google Sheet. Check the URL and ensure the sheet is publicly accessible."
+            send_error_notification(
+                email_address, 
+                "Google Sheet Download Failed", 
+                error_msg,
+                request_data
+            )
+            return jsonify({"status": "error", "message": error_msg}), 500
+
+        # 4. Read the business names
+        df = pd.read_csv(StringIO(csv_data))
+        business_names = df.iloc[:, 0].tolist()
+        
+        if not business_names:
+            error_msg = "No business names found in the spreadsheet."
+            send_error_notification(
+                email_address, 
+                "Empty Spreadsheet", 
+                error_msg,
+                request_data
+            )
+            return jsonify({"status": "error", "message": error_msg}), 400
+
+        # 5. Split into batches and create Celery tasks
+        batches = []
+        total_businesses = len(business_names)
+        total_batches = (total_businesses + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        for i in range(0, total_businesses, BATCH_SIZE):
+            batch = business_names[i:i + BATCH_SIZE]
+            batch_number = (i // BATCH_SIZE) + 1
+            
+            batch_data = {
+                'business_names': batch,
+                'batch_number': batch_number,
+                'total_batches': total_batches
+            }
+            batches.append(process_audit_batch.s(batch_data))
+        
+        # 6. Create a chord: all batches run in parallel, then combine results
+        callback = combine_and_send_results.s(
+            email_address=email_address,
+            output_filename_prefix=output_filename_prefix,
+            total_businesses=total_businesses
+        )
+        
+        job = chord(batches)(callback)
+        
+        # 7. Return immediately with job ID
         return jsonify({
-            "status": "accepted", 
-            "message": f"Audit started. Results will be sent to {email_address} when complete. This may take several minutes depending on the number of businesses."
+            "status": "accepted",
+            "message": f"Audit started with {total_businesses} businesses split into {total_batches} batches. Results will be sent to {email_address} when complete.",
+            "job_id": str(job.id),
+            "total_businesses": total_businesses,
+            "total_batches": total_batches,
+            "batch_size": BATCH_SIZE
         }), 202
 
     except Exception as e:
@@ -327,7 +240,6 @@ def run_audit_endpoint():
         print(error_msg)
         print(error_traceback)
         
-        # Try to send error notification if we have an email address
         try:
             if 'email_address' in locals() and email_address:
                 send_error_notification(
@@ -337,17 +249,43 @@ def run_audit_endpoint():
                     request_data
                 )
         except:
-            pass  # Don't let error notification failure crash the endpoint
+            pass
             
         return jsonify({"status": "error", "message": error_msg}), 500
 
+@app.route('/status/<job_id>', methods=['GET'])
+def check_status(job_id):
+    """Check the status of a job"""
+    try:
+        from celery.result import AsyncResult
+        result = AsyncResult(job_id, app=celery)
+        
+        if result.ready():
+            return jsonify({
+                "status": "completed",
+                "ready": True
+            })
+        elif result.failed():
+            return jsonify({
+                "status": "failed",
+                "ready": True,
+                "error": str(result.info)
+            })
+        else:
+            return jsonify({
+                "status": "processing",
+                "ready": False
+            })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
 @app.route('/')
 def home():
-    """
-    Simple welcome message for the root URL.
-    """
+    """Simple welcome message for the root URL."""
     return "The NAP Auditor is running. Use the /audit endpoint to send data."
 
 if __name__ == '__main__':
-    # This block is for local development only. Gunicorn will use the `app` instance.
     app.run(debug=True)

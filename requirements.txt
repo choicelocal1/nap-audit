@@ -10,3 +10,5 @@ openpyxl
 werkzeug
 selenium
 urllib3
+celery
+redis
