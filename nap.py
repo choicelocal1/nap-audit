@@ -863,7 +863,7 @@ def main():
     
     print(f"Reading business names from {input_file}...")
     auditor.process_input_file(input_file)
-    
+    #small change
     print("\nProcessing complete.")
 
 if __name__ == '__main__':
